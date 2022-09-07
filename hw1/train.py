@@ -1,7 +1,9 @@
 import tqdm
 import torch
+import torch.nn.functional as F
 import argparse
 from sklearn.metrics import accuracy_score
+import json
 
 from utils import (
     get_device,
@@ -26,9 +28,78 @@ def setup_dataloader(args):
 
     # Hint: use the helper functions provided in utils.py
     # ===================================================== #
-    train_loader = None
-    val_loader = None
-    return train_loader, val_loader
+    # Load the data from the json
+    data = json.load(open(args.in_data_fn))
+
+    # Use the utils to construct the necessary maps
+    vocab_to_index, index_to_vocab, max_seq_len = (
+        build_tokenizer_table(data['train'], vocab_size = args.vocab_size)
+    )
+    actions_to_index, index_to_actions, targets_to_index, index_to_targets = (
+        build_output_tables(data['train'])
+    )
+
+    maps = [vocab_to_index, index_to_vocab, actions_to_index, 
+            index_to_actions, targets_to_index, index_to_targets]
+
+    # List of tokenized instructions, actions, and targets for each dataset
+    train_dict = {"instructions": [], "actions": [], "targets": []}
+    val_dict = {"instructions": [], "actions": [], "targets": []}
+    data_dicts = [train_dict, val_dict]
+
+    print('begin')
+
+    # Iterate through every episode in each dataset
+    for dataset, data_dict in zip(data.values(), data_dicts):
+        for episode in dataset:
+            for inst, outseq in episode:
+                # Tokenize and store instructions
+                # Begin each instruction with a <start> token
+                inst_tokens = [vocab_to_index['<start>']]
+                inst = preprocess_string(inst)
+
+                # Word level tokenization
+                for word in inst.split(" "):
+                    word_idx = vocab_to_index.get(word, vocab_to_index['<unk>'])
+                    inst_tokens.append(word_idx)
+                
+                # Truncate instruction tokens to max_seq_len
+                if len(inst_tokens) > max_seq_len:
+                    inst_tokens = inst_tokens[:max_seq_len]
+                
+                # Add <pad> and <end> tokens where applicable
+                if len(inst_tokens) < max_seq_len:
+                    for _ in range(max_seq_len - len(inst_tokens) - 1):
+                        inst_tokens.append(vocab_to_index['<pad>'])
+                    inst_tokens.append(vocab_to_index['<end>'])
+
+                # Tokenize and store action and target
+                a, t = outseq
+
+                # Store tokens in relevant data dict
+                data_dict['instructions'].append(inst_tokens)
+                data_dict['actions'].append(actions_to_index[a])
+                data_dict['targets'].append(targets_to_index[t])  
+
+        # Convert all token lists to Tensors of int64
+        data_dict['instructions'] = torch.Tensor(data_dict['instructions']).to(torch.int64)
+        data_dict['actions'] = torch.Tensor(data_dict['actions']).to(torch.int64)
+        data_dict['targets'] = torch.Tensor(data_dict['targets']).to(torch.int64)
+
+        # Perform one-hot encoding on all token Tensors
+        # Specify num_classes to preserve size of array across data inputs
+        data_dict['instructions'] = F.one_hot(data_dict['instructions'],
+                                              num_classes = args.vocab_size)
+        data_dict['actions'] = F.one_hot(data_dict['actions'],
+                                         num_classes = len(actions_to_index))
+        data_dict['targets'] = F.one_hot(data_dict['targets'],
+                                         num_classes = len(targets_to_index))
+    
+    print('tokenized')
+    
+    train_loader = torch.utils.data.DataLoader(train_dict)
+    val_loader = torch.utils.data.DataLoader(val_dict)
+    return train_loader, val_loader, maps
 
 
 def setup_model(args):
@@ -255,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_every", default=5, help="number of epochs between every eval loop"
     )
+    parser.add_argument("--vocab_size", default=1000, help="number of tokens in vocab")
 
     # ================== TODO: CODE HERE ================== #
     # Task (optional): Add any additional command line
