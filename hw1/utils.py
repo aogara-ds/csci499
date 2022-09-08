@@ -14,6 +14,11 @@ def get_device(force_cpu, status=True):
         device = torch.device("cuda")
         if status:
             print("Using CUDA")
+    elif torch.backends.mps.is_available() \
+        and torch.backends.mps.is_built():
+        device = torch.device("mps")
+        if status:
+            print("Using Apple MPS")
     else:
         device = torch.device("cpu")
         if status:
