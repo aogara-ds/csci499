@@ -1,9 +1,11 @@
-import tqdm
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 import argparse
 from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
 import json
+import torchviz
 
 from utils import (
     get_device,
@@ -153,7 +155,13 @@ class LSTM(torch.nn.Module):
 
         # Initialize some hyperparameters
         self.embedding_dim = 128
-        self.lstm_hidden_dim = 128
+        self.lstm_dim = 128
+        if args.maxpool:
+            self.lstm_dim = int(self.lstm_dim / 2)
+            self.final_hidden_dim = self.lstm_dim * 2
+        else:
+            self.final_hidden_dim = self.lstm_dim
+        # TODO: Add feature sizing for maxpool
         self.lstm_layers = 1
         self.dropout = 0
         self.bidirectional = False
@@ -166,16 +174,16 @@ class LSTM(torch.nn.Module):
 
         # Initialize an LSTM block using our hyperparameters
         self.lstm = torch.nn.LSTM(input_size=self.embedding_dim, 
-                                  hidden_size=self.lstm_hidden_dim,
+                                  hidden_size=self.lstm_dim,
                                   num_layers=self.lstm_layers,
                                   dropout=self.dropout,
                                   bidirectional=self.bidirectional,
                                   batch_first=True)
 
         # Initialize a fully-connected linear layer
-        self.fc_action = torch.nn.Linear(in_features=self.lstm_hidden_dim,
+        self.fc_action = torch.nn.Linear(in_features=self.final_hidden_dim,
                                          out_features=self.action_classes)
-        self.fc_target = torch.nn.Linear(in_features=self.lstm_hidden_dim,
+        self.fc_target = torch.nn.Linear(in_features=self.final_hidden_dim,
                                          out_features=self.target_classes)
 
     def forward(self, inputs):
@@ -184,25 +192,22 @@ class LSTM(torch.nn.Module):
         """
         # Embed the inputs
         embeds = self.embed(inputs)
-        # TODO: Check the embedding dimension, make sure it's (len_input, batch, hidden_features)
 
         # Run the embeddings through the LSTM
-        # TODO; You probably want the final hidden state, not each token's representation
         lstm_output, (h_n, c_n)  = self.lstm(embeds)
 
+        # Maxpool the LSTM word embeddings and concatenate with the hidden state
+        if args.maxpool:
+            max_lstm_output = F.max_pool1d(lstm_output.transpose(-1, -2), 
+                                        kernel_size=lstm_output.size()[1])
+            h_n = torch.cat((max_lstm_output.squeeze(), h_n.squeeze()), dim=-1)
+
         # Use two separate fully connected layers to predict actions and targets
-        action_mass = self.fc_action(h_n)
-        target_mass = self.fc_target(h_n)
+        action_mass = self.fc_action(h_n).squeeze()
+        target_mass = self.fc_target(h_n).squeeze()
 
-        # Perform softmax to turn probability mass into probabilities
-        # action_probs = F.softmax(action_mass)
-        # target_probs = F.softmax(target_mass)
-
-        # return action_probs, target_probs
-
-        return action_mass.squeeze(), target_mass.squeeze()
+        return action_mass, target_mass
         
-
 
 def setup_model(args, maps, device):
     """
@@ -230,12 +235,10 @@ def setup_optimizer(args, model):
     # ===================================================== #
     action_criterion = torch.nn.CrossEntropyLoss()
     target_criterion = torch.nn.CrossEntropyLoss()
-    # TODO: How do I optimize the heads separately?
-    # TODO: Do I not call softmax inside the LSTM?
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
 
     return action_criterion, target_criterion, optimizer
-
 
 def train_epoch(
     args,
@@ -257,8 +260,7 @@ def train_epoch(
     target_labels = []
 
     # iterate over each batch in the dataloader
-    # NOTE: you may have additional outputs from the loader __getitem__, you can modify this
-    for inputs, actions, targets in loader:
+    for inputs, actions, targets in tqdm(loader):
         # put model inputs to device
         inputs, actions, targets = inputs.to(device), actions.to(device), targets.to(device)
 
@@ -267,8 +269,6 @@ def train_epoch(
         actions_out, targets_out = model(inputs)
 
         # calculate the action and target prediction loss
-        # NOTE: we assume that labels is a tensor of size Bx2 where labels[:, 0] is the
-        # action label and labels[:, 1] is the target label
         action_loss = action_criterion(actions_out.squeeze(), actions.float())
         target_loss = target_criterion(targets_out.squeeze(), targets.float())
 
@@ -290,14 +290,6 @@ def train_epoch(
         target_preds_ = targets_out.argmax(-1)
         actions_ = actions.argmax(-1)
         targets_ = targets.argmax(-1)
-
-        # print('shapecheck')
-        # print(actions.shape)
-        # print(targets.shape)
-        # print(actions_out.shape)
-        # print(targets_out.shape)
-        # print(action_preds_)
-        # print(target_preds_)
 
         # aggregate the batch predictions + labels
         action_preds.extend(action_preds_.cpu().numpy())
@@ -339,8 +331,16 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
     # In each epoch we compute loss on each sample in our dataset and update the model
     # weights via backpropagation
     model.train()
+    model.to(device)
 
-    for epoch in tqdm.tqdm(range(args.num_epochs)):
+    # Setup lists to track loss and accuracy over epochs
+    train_action_accs, train_action_losses = [],[]
+    train_target_accs, train_target_losses = [],[]
+    val_action_accs, val_action_losses = [],[]
+    val_target_accs, val_target_losses = [],[]
+    train_epoch_nums, val_epoch_nums = [],[]
+
+    for epoch in tqdm(range(args.num_epochs)):
 
         # train single epoch
         # returns loss for action and target prediction and accuracy
@@ -360,12 +360,16 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
         )
 
         # some logging
-        print(
-            f"train action loss : {train_action_loss} | train target loss: {train_target_loss}"
-        )
-        print(
-            f"train action acc : {train_action_acc} | train target acc: {train_target_acc}"
-        )
+        print(f"train action loss : {train_action_loss}")
+        print(f"train target loss: {train_target_loss}")
+        print(f"train action acc : {train_action_acc}")
+        print(f"train target acc: {train_target_acc}")
+        train_action_accs.append(train_action_acc)
+        train_action_losses.append(train_action_loss)
+        train_target_accs.append(train_target_acc)
+        train_target_losses.append(train_target_loss)
+        train_epoch_nums.append(epoch)
+
 
         # run validation every so often
         # during eval, we run a forward pass through the model and compute
@@ -388,12 +392,55 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
                 f"val action acc : {val_action_acc} | val target losaccs: {val_target_acc}"
             )
 
+            val_action_accs.append(val_action_acc)
+            val_action_losses.append(val_action_loss)
+            val_target_accs.append(val_target_acc)
+            val_target_losses.append(val_target_loss)
+            val_epoch_nums.append(epoch)
+
     # ================== TODO: CODE HERE ================== #
     # Task: Implement some code to keep track of the model training and
     # evaluation loss. Use the matplotlib library to plot
     # 4 figures for 1) training loss, 2) training accuracy,
     # 3) validation loss, 4) validation accuracy
+    # four plots, each with a train and val line. 
+    # accuracy, loss * action, target
     # ===================================================== #
+
+    # Divides Loss by Len to find Average Loss Per Example
+    train_action_losses = [i/len(loaders['train']) for i in train_action_losses]
+    train_target_losses = [i/len(loaders['train']) for i in train_target_losses]
+    val_action_losses = [i/len(loaders['val']) for i in val_action_losses]
+    val_target_losses = [i/len(loaders['val']) for i in val_target_losses]
+
+    # Creates four subplots on the same figure, with two lines on each plot
+    # The four plots represent accuracy and loss on actions and targets
+    # The two lines represent training vs validation measures
+    # Credit to: https://matplotlib.org/stable/gallery/subplots_axes_and_figures/subplots_demo.html
+    fig, axs = plt.subplots(2, 2)
+    axs[0, 0].plot(train_epoch_nums, train_action_accs, "b--", label="train") 
+    axs[0, 0].plot(val_epoch_nums, val_action_accs, "b-", label="validation")
+    axs[0, 0].legend(loc="upper left")
+    axs[0, 0].set_title('Action Accuracy')
+    axs[0, 1].plot(train_epoch_nums, train_target_accs, "o--", label="train")
+    axs[0, 1].plot(val_epoch_nums, val_target_accs, "o-", label="validation")
+    axs[0, 1].legend(loc="upper left")
+    axs[0, 1].set_title('Target Accuracy')
+    axs[1, 0].plot(train_epoch_nums, train_action_losses, "m--", label="train")
+    axs[1, 0].plot(val_epoch_nums, val_action_losses, "m-", label="validation")
+    axs[1, 0].legend(loc="upper right")
+    axs[1, 0].set_title('Action Loss')
+    axs[1, 1].plot(train_epoch_nums, train_target_losses, "g--", label="train")
+    axs[1, 1].plot(val_epoch_nums, val_target_losses, "g-", label="validation")
+    axs[1, 1].legend(loc="upper right")
+    axs[1, 1].set_title('Target Loss')
+
+    # Hide x labels and tick labels for top plots and y ticks for right plots.
+    for ax in axs.flat:
+        ax.label_outer()
+        ax.xlabel('Epoch #')
+    
+    plt.show()
 
 
 def main(args):
@@ -438,7 +485,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--force_cpu", action="store_true", help="debug mode")
     parser.add_argument("--eval", action="store_true", help="run eval")
-    parser.add_argument("--num_epochs", default=1000, help="number of training epochs", type=int)
+    parser.add_argument("--maxpool", action="store_true", 
+                        help="model uses lstm hidden state and token outputs")
+    parser.add_argument(
+        "--num_epochs", default=1000, help="number of training epochs", type=int
+    )
     parser.add_argument(
         "--val_every", default=5, help="number of epochs between every eval loop", type=int
     )
