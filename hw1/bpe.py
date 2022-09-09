@@ -1,6 +1,7 @@
 import re
 import json
 import torch
+import torch.nn.functional as F
 import numpy as np
 from collections import Counter
 from utils import build_output_tables, preprocess_string
@@ -259,6 +260,9 @@ def encode_bpe_word(string, tokens_to_index):
 
             # Check for another instance of the token and potentially repeat
             last = string.rfind(token)
+        
+        if string.replace(" ", "") == "":
+            break
 
     # TODO: Store any unknown tokens. Cool but not necessary given our preprocessing. 
 
