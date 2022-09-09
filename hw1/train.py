@@ -4,17 +4,22 @@ import torch.nn.functional as F
 import argparse
 from sklearn.metrics import accuracy_score
 import matplotlib.pyplot as plt
+import numpy as np
 import json
-import torchviz
+import time
+import re
 
 from utils import (
     get_device,
     preprocess_string,
     build_tokenizer_table,
     build_output_tables,
+    build_bpe_table,
+    get_best_byte_pair,
+    merge_vocab
 )
 
-def preprocess_data(args):
+def tokenize_words(args):
     # ================== TODO: CODE HERE ================== #
     # Task: Load the training data from provided json file.
     # Perform some preprocessing to tokenize the natural
@@ -24,6 +29,10 @@ def preprocess_data(args):
 
     # Hint: use the helper functions provided in utils.py
     # ===================================================== #
+    # Code for Tokenizer Analysis
+    unk_count, word_count = 0, 0
+    begin_tokenizer = time.time()
+
     # Load the data from the json
     data = json.load(open(args.in_data_fn))
 
@@ -35,6 +44,7 @@ def preprocess_data(args):
         build_output_tables(data['train'])
     )
 
+    # Store maps in a single list for convenience
     maps = [vocab_to_index, index_to_vocab, actions_to_index, 
             index_to_actions, targets_to_index, index_to_targets]
 
@@ -42,8 +52,6 @@ def preprocess_data(args):
     train_dict = {"instructions": [], "actions": [], "targets": []}
     val_dict = {"instructions": [], "actions": [], "targets": []}
     data_dicts = [train_dict, val_dict]
-
-    print('begin')
 
     # Iterate through every episode in each dataset
     for dataset, data_dict in zip(data.values(), data_dicts):
@@ -55,10 +63,15 @@ def preprocess_data(args):
                 inst = preprocess_string(inst)
 
                 # Word level tokenization
-                for word in inst.split(" "):
-                    word_idx = vocab_to_index.get(word, vocab_to_index['<unk>'])
+                for word in inst.lower().split(" "):
+                    word_idx = vocab_to_index.get(word, vocab_to_index['<unk>'])                    
                     inst_tokens.append(word_idx)
-                
+
+                    if word_idx == vocab_to_index['<unk>']:
+                        unk_count += 1 
+                    else:
+                        word_count += 1
+
                 # Truncate instruction tokens to max_seq_len
                 if len(inst_tokens) > max_seq_len:
                     inst_tokens = inst_tokens[:max_seq_len]
@@ -82,16 +95,152 @@ def preprocess_data(args):
         data_dict['actions'] = torch.Tensor(data_dict['actions']).to(torch.int64)
         data_dict['targets'] = torch.Tensor(data_dict['targets']).to(torch.int64)
 
-        # # Perform one-hot encoding on all token Tensors
-        # # Specify num_classes to preserve size of array across data inputs
-        # data_dict['instructions'] = F.one_hot(data_dict['instructions'],
-        #                                       num_classes = args.vocab_size)
+        # Perform one-hot encoding on actions and targets
+        # Note that tokens do not require one-hot embedding because
+        # torch.nn.Embedding() takes as an input a tensor of integers
         data_dict['actions'] = F.one_hot(data_dict['actions'],
                                          num_classes = len(actions_to_index))
         data_dict['targets'] = F.one_hot(data_dict['targets'],
                                          num_classes = len(targets_to_index))
     
     print('preprocessed')
+    print(f'UNK Count: {unk_count}')
+    print(f'Word Count: {word_count}')
+    print(f'Tokenizer Time: {time.time() - begin_tokenizer}')
+
+    return train_dict, val_dict, maps
+
+def encode_bpe_word(string, tokens_to_index):
+    """
+    Custom function for encoding a single word in BPE. 
+    Returns a list of indices of BPE tokens. 
+
+    This is much simpler than the online version I referenced!
+    tokenize_word() from https://leimao.github.io/blog/Byte-Pair-Encoding/ 
+    I wonder if I'm missing any edge cases -- manual inspection looks good
+    but I don't have any proper testing yet. It doesn't handle unknown tokens. 
+    """
+    output_tokens = []
+    string = string + "</w>"
+    # Loop through tokens from longest to shortest
+    for token, idx in tokens_to_index.items():
+        # Find the last occurence of the token in the string
+        last = string.rfind(token)
+
+        # If the token appears in the string
+        while last != -1:
+            # Replace it with a space
+            string = string[:last] + " " + string[last + len(token):]
+
+            # The number of previous tokens == the number of previous spaces
+            previous_tokens = string[:last].count(' ')
+
+            # Insert the idx of this token after all of the previous tokens
+            output_tokens.insert(previous_tokens, idx)
+
+            # Check for another instance of the token and potentially repeat
+            last = string.rfind(token)
+
+    # TODO: Store any unknown tokens. Cool but not necessary given our preprocessing. 
+
+    return output_tokens
+
+
+def tokenize_bpe(args):
+    """
+    Uses Byte-Pair Encoding to tokenize the entire instruciton set. 
+    Returns the tokenized training data, validation data, and maps. 
+
+    Original implementation based on Sennrich, Haddow, and Birch, 2016
+    Link to paper here: https://arxiv.org/pdf/1508.07909.pdf
+    Runs successfully in about 10 minutes -- how do I speed this up?
+    """
+    # Code for Tokenizer Analysis
+    begin_tokenizer = time.time()
+
+    # Load the data from the json
+    data = json.load(open(args.in_data_fn))
+
+    # Use the utils to construct the necessary maps
+    tokens_to_index, index_to_tokens = (
+        build_bpe_table(data['train'], vocab_size = args.vocab_size)
+    )
+    actions_to_index, index_to_actions, targets_to_index, index_to_targets = (
+        build_output_tables(data['train'])
+    )
+
+    # Store maps in a single list for convenience
+    maps = [tokens_to_index, index_to_tokens, actions_to_index, 
+            index_to_actions, targets_to_index, index_to_targets]
+
+    # List of tokenized instructions, actions, and targets for each dataset
+    train_dict = {"instructions": [], "actions": [], "targets": []}
+    val_dict = {"instructions": [], "actions": [], "targets": []}
+    data_dicts = [train_dict, val_dict]
+
+    # Track statistics to determine max_seq_len
+    token_lens = []
+    in_training = False
+    
+    # Iterate through every episode in each dataset
+    for dataset, data_dict in zip(data.values(), data_dicts):
+        in_training = not in_training
+        for episode in tqdm(dataset):
+            for inst, outseq in episode:
+                # Begin each instruction with a <start> token
+                inst_tokens = [tokens_to_index['<start>']]
+                inst = preprocess_string(inst)
+
+                # Tokenize each word of the instruction individually
+                for word in inst.lower().split(" "):
+                    word_tokens = encode_bpe_word(word, tokens_to_index)
+                    inst_tokens.extend(word_tokens)
+
+                # Tokenize and store action and target
+                a, t = outseq
+
+                # Store tokens in relevant data dict
+                data_dict['instructions'].append(inst_tokens)
+                data_dict['actions'].append(actions_to_index[a])
+                data_dict['targets'].append(targets_to_index[t])  
+
+                # Store statistics for calculating max_seq_len
+                if in_training:
+                    # Add 1 for end token
+                    token_lens.append(len(inst_tokens) + 1)
+
+    # Calculate the maximum sequence length
+    max_seq_len = int(np.average(token_lens) + 2 * np.std(token_lens) + 0.5)
+    for data_dict in data_dicts:
+        # Apply max_seq_len to each tokenized list of instructions
+        for i, token_list in enumerate(data_dict['instructions']):
+            # Truncate instruction tokens to max_seq_len
+            if len(token_list) > max_seq_len:
+                data_dict['instructions'][i] = token_list[:max_seq_len]
+            
+            # Add <pad> and <end> tokens where applicable
+            if len(token_list) < max_seq_len:
+                for _ in range(int(max_seq_len - len(data_dict['instructions'][i]) - 1)):
+                    data_dict['instructions'][i].append(tokens_to_index['<pad>'])
+                data_dict['instructions'][i].append(tokens_to_index['<end>'])
+
+            assert len(data_dict['instructions'][i]) == max_seq_len
+
+        # Convert all token lists to Tensors of int64
+        data_dict['instructions'] = torch.Tensor(data_dict['instructions']).to(torch.int64)
+        data_dict['actions'] = torch.Tensor(data_dict['actions']).to(torch.int64)
+        data_dict['targets'] = torch.Tensor(data_dict['targets']).to(torch.int64)
+
+        # Perform one-hot encoding on actions and targets
+        # Note that tokens do not require one-hot embedding because
+        # torch.nn.Embedding() takes as an input a tensor of integers
+        data_dict['actions'] = F.one_hot(data_dict['actions'],
+                                         num_classes = len(actions_to_index))
+        data_dict['targets'] = F.one_hot(data_dict['targets'],
+                                         num_classes = len(targets_to_index))
+    
+    print(f'BPE Tokenizer Time: {time.time() - begin_tokenizer}')
+    print("No Unknown Tokens")
 
     return train_dict, val_dict, maps
 
@@ -130,7 +279,10 @@ def setup_dataloader(args):
         - val_loader: torch.utils.data.Dataloader
     """
     # Process the text into tokens stored in dictionaries
-    train_dict, val_dict, maps = preprocess_data(args)
+    if args.bpe:
+        train_dict, val_dict, maps = tokenize_bpe(args)
+    else:
+        train_dict, val_dict, maps = tokenize_words(args)
 
     # Store the tokenized data in a custom defined Dataset object
     train_dataset = alfred_dataset(train_dict)
@@ -161,7 +313,6 @@ class LSTM(torch.nn.Module):
             self.final_hidden_dim = self.lstm_dim * 2
         else:
             self.final_hidden_dim = self.lstm_dim
-        # TODO: Add feature sizing for maxpool
         self.lstm_layers = 1
         self.dropout = 0
         self.bidirectional = False
@@ -170,7 +321,8 @@ class LSTM(torch.nn.Module):
 
         # Initialize an embedding layer the size of our vocabulary
         self.embed = torch.nn.Embedding(num_embeddings=args.vocab_size, 
-                                        embedding_dim=self.embedding_dim)
+                                        embedding_dim=self.embedding_dim,
+                                        padding_idx=maps[0]['<pad>'])
 
         # Initialize an LSTM block using our hyperparameters
         self.lstm = torch.nn.LSTM(input_size=self.embedding_dim, 
@@ -334,11 +486,12 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
     model.to(device)
 
     # Setup lists to track loss and accuracy over epochs
-    train_action_accs, train_action_losses = [],[]
-    train_target_accs, train_target_losses = [],[]
-    val_action_accs, val_action_losses = [],[]
-    val_target_accs, val_target_losses = [],[]
-    train_epoch_nums, val_epoch_nums = [],[]
+    if args.show_plot==True:
+        train_action_accs, train_action_losses = [],[]
+        train_target_accs, train_target_losses = [],[]
+        val_action_accs, val_action_losses = [],[]
+        val_target_accs, val_target_losses = [],[]
+        train_epoch_nums, val_epoch_nums = [],[]
 
     for epoch in tqdm(range(args.num_epochs)):
 
@@ -364,11 +517,12 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
         print(f"train target loss: {train_target_loss}")
         print(f"train action acc : {train_action_acc}")
         print(f"train target acc: {train_target_acc}")
-        train_action_accs.append(train_action_acc)
-        train_action_losses.append(train_action_loss)
-        train_target_accs.append(train_target_acc)
-        train_target_losses.append(train_target_loss)
-        train_epoch_nums.append(epoch)
+        if args.show_plot==True:
+            train_action_accs.append(train_action_acc)
+            train_action_losses.append(train_action_loss)
+            train_target_accs.append(train_target_acc)
+            train_target_losses.append(train_target_loss)
+            train_epoch_nums.append(epoch)
 
 
         # run validation every so often
@@ -391,27 +545,50 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
             print(
                 f"val action acc : {val_action_acc} | val target losaccs: {val_target_acc}"
             )
-
-            val_action_accs.append(val_action_acc)
-            val_action_losses.append(val_action_loss)
-            val_target_accs.append(val_target_acc)
-            val_target_losses.append(val_target_loss)
-            val_epoch_nums.append(epoch)
+            if args.show_plot==True:
+                val_action_accs.append(val_action_acc)
+                val_action_losses.append(val_action_loss)
+                val_target_accs.append(val_target_acc)
+                val_target_losses.append(val_target_loss)
+                val_epoch_nums.append(epoch)
 
     # ================== TODO: CODE HERE ================== #
     # Task: Implement some code to keep track of the model training and
     # evaluation loss. Use the matplotlib library to plot
     # 4 figures for 1) training loss, 2) training accuracy,
     # 3) validation loss, 4) validation accuracy
-    # four plots, each with a train and val line. 
-    # accuracy, loss * action, target
     # ===================================================== #
+    if args.show_plot==True:
+        # Divides Loss by len(loss) to find Average Loss Per Example
+        train_action_losses = [i/len(loaders['train']) for i in train_action_losses]
+        train_target_losses = [i/len(loaders['train']) for i in train_target_losses]
+        val_action_losses = [i/len(loaders['val']) for i in val_action_losses]
+        val_target_losses = [i/len(loaders['val']) for i in val_target_losses]
 
-    # Divides Loss by Len to find Average Loss Per Example
-    train_action_losses = [i/len(loaders['train']) for i in train_action_losses]
-    train_target_losses = [i/len(loaders['train']) for i in train_target_losses]
-    val_action_losses = [i/len(loaders['val']) for i in val_action_losses]
-    val_target_losses = [i/len(loaders['val']) for i in val_target_losses]
+        # Generates the plot
+        plot_performance(train_action_accs, train_action_losses,
+                         train_target_accs, train_target_losses,
+                         val_action_accs, val_action_losses,
+                         val_target_accs, val_target_losses,
+                         train_epoch_nums, val_epoch_nums)
+
+
+def plot_performance(train_action_accs, train_action_losses,
+                     train_target_accs, train_target_losses,
+                     val_action_accs, val_action_losses,
+                     val_target_accs, val_target_losses,
+                     train_epoch_nums, val_epoch_nums):
+    """
+    Given the lists of performance tracked in train(),
+    shows a matplotlib figure for containing four plots:
+        1. Accuracy on Actions 
+        2. Accuracy on Targets
+        3. Loss on Actions
+        4. Loss on Targets
+    
+    Each plot shows both the train and validation performance
+    in order to help assess overfitting on the training data. 
+    """
 
     # Creates four subplots on the same figure, with two lines on each plot
     # The four plots represent accuracy and loss on actions and targets
@@ -438,7 +615,8 @@ def train(args, model, loaders, optimizer, action_criterion, target_criterion, d
     # Hide x labels and tick labels for top plots and y ticks for right plots.
     for ax in axs.flat:
         ax.label_outer()
-        ax.xlabel('Epoch #')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Performance')
     
     plt.show()
 
@@ -485,8 +663,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--force_cpu", action="store_true", help="debug mode")
     parser.add_argument("--eval", action="store_true", help="run eval")
-    parser.add_argument("--maxpool", action="store_true", 
-                        help="model uses lstm hidden state and token outputs")
     parser.add_argument(
         "--num_epochs", default=1000, help="number of training epochs", type=int
     )
@@ -498,8 +674,14 @@ if __name__ == "__main__":
     # Task (optional): Add any additional command line
     # parameters you may need here
     # ===================================================== #
-    parser.add_argument("--vocab_size", default=1000, help="number of tokens in vocab")
-
+    parser.add_argument("--vocab_size", default=1000, 
+                        help="number of tokens in vocab", type=int)
+    parser.add_argument("--maxpool", action="store_true", 
+                        help="model uses lstm hidden state and token outputs")
+    parser.add_argument('--show_plot', action='store_true', 
+                        help='displays plot of performance over epochs')
+    parser.add_argument('--bpe', action='store_true', 
+                    help='uses BPE instead of word-level tokenization')
     args = parser.parse_args()
 
     main(args)
